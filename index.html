@@ -182,7 +182,7 @@ function saveSurvey(force){
   svSavedAt = now;
   try { localStorage.setItem('rw-survey', JSON.stringify(svRaw.slice(-SV_MAX))); } catch(e){}
 }
-try { svWanted = localStorage.getItem('rw-sv') === 'on'; } catch(e){}
+// The stream is a debug tool: off on every page load, on only when asked.
 
 /* ---------- storage ---------- */
 function loadLog(){ try { return JSON.parse(localStorage.getItem('rw-log') || '[]'); } catch(e){ return []; } }
@@ -364,7 +364,6 @@ function devDetail(d){
 }
 
 function renderDev(now){
-  $('list').parentElement.hidden = devView;
   if (rawOn){
     $('devList').hidden = true; $('raw').hidden = false;
     $('dvCount').textContent = 'Raw log: last 150 of ' + svRaw.length + ' lines, newest at the bottom';
@@ -404,7 +403,6 @@ function renderSvBtn(on){
 
 async function toggleStream(){
   svWanted = !svWanted;
-  try { localStorage.setItem('rw-sv', svWanted ? 'on' : 'off'); } catch(e){}
   renderSvBtn(svWanted);
   if (!(await sendCmd({ cmd: 'sv', on: svWanted ? 1 : 0 })) && svWanted)
     toast('Saved. The stream starts when the detector is connected.');
@@ -482,9 +480,20 @@ function renderList(now){
       <div>
         <div class="l1">${esc(t.label)}</div>
         <div class="l2">${esc(t.src)}${t.board ? ' (board ' + esc(t.board) + ')' : ''}, ${esc(t.mac)}${t.name ? ', ' + esc(t.name) : ''}</div>
+        <div class="l3">${esc(alertDetail(t))}</div>
       </div>
       <div class="r"><b>${t.rssi} dBm</b><span>${ago(now - t.last)}</span></div>
     </li>`).join('');
+}
+
+// OUI, how it was matched and how sure; channel(s) if the survey heard it too.
+function alertDetail(t){
+  const parts = ['OUI ' + oui(t.mac)];
+  if (t.md) parts.push('via ' + t.md);
+  if (t.cf !== undefined) parts.push('confidence T' + t.cf);
+  const sd = svDevs.get((t.board || 'A') + ' ' + t.mac);
+  if (sd && sd.ch.size) parts.push('ch ' + [...sd.ch].sort((x, y) => x - y).join(','));
+  return parts.join(' · ');
 }
 
 function renderLink(){
@@ -492,16 +501,17 @@ function renderLink(){
   if (linked()){
     const quiet = Date.now() - lastHb > 6000;
     el.dataset.state = quiet ? 'warn' : 'live';
-    // fr / ba = Wi-Fi frames / board B's BLE adverts in the last 2 s heartbeat.
-    // A BLE count of 0 while B is linked means B's scanner isn't hearing anything.
-    // Firmware that reports "fr" hops channels 4x a second; its "ch" is just
-    // wherever the hop happened to be (always the same, since the heartbeat
-    // period is a multiple of the hop cycle), so show traffic instead.
+    // fr / ba = Wi-Fi packets / board B's BLE adverts in the last 2 s heartbeat,
+    // shown per second and labelled as rates: a bare number read like a
+    // (5 GHz) channel. Both boards are 2.4 GHz only. A BLE rate of 0 while B
+    // is linked means B's scanner isn't hearing anything. Firmware with "fr"
+    // hops channels 4x a second, so its "ch" isn't worth showing.
+    const perSec = n => Math.round(n / 2);
     txt.textContent = quiet ? 'Connected, no data from detector'
       : 'Scanning' + (hbInfo && hbInfo.fr === undefined ? ' channel ' + hbInfo.ch : '')
-        + (hbInfo && hbInfo.fr !== undefined ? ' Wi-Fi ' + hbInfo.fr : '')
+        + (hbInfo && hbInfo.fr !== undefined ? ', Wi-Fi ' + perSec(hbInfo.fr) + ' pkt/s' : '')
         + (hbInfo && hbInfo.bl !== undefined
-            ? (hbInfo.bl ? ', board B linked' + (hbInfo.ba !== undefined ? ' (BLE ' + hbInfo.ba + ')' : '')
+            ? (hbInfo.bl ? ', board B linked' + (hbInfo.ba !== undefined ? ' (BLE ' + perSec(hbInfo.ba) + '/s)' : '')
                          : ', board B offline')
             : '');
     btn.textContent = 'Disconnect';
@@ -514,7 +524,11 @@ function renderLink(){
   }
 }
 
-function render(){ const now = Date.now(); renderHero(now); renderList(now); }
+function render(){
+  const now = Date.now();
+  renderHero(now);
+  if (devView) renderDev(now); else renderList(now);
+}
 
 /* ---------- sound ---------- */
 function unlockAudio(){
@@ -603,9 +617,32 @@ $('connectBtn').onclick = () => (linked() || wantConnected) ? disconnect() : con
 $('demoBtn').onclick = toggleDemo;
 $('copyBtn').onclick = copyLog;
 $('clearBtn').onclick = () => {
-  if (!confirm('Clear the screen and the saved log?')) return;
-  tracks.clear(); log = []; saveLog(); render(); toast('Cleared');
+  if (!confirm('Clear the screen, the saved log and the survey data?')) return;
+  tracks.clear(); log = []; saveLog();
+  svDevs.clear(); svRaw = []; saveSurvey(true);
+  render(); toast('Cleared');
 };
+$('devBtn').onclick = () => {
+  devView = !devView;
+  $('alertView').hidden = devView; $('devView').hidden = !devView;
+  $('devBtn').textContent = devView ? 'Alerts' : 'Devices';
+  render();
+};
+$('markBtn').onclick = mark;
+$('svBtn').onclick = toggleStream;
+$('rawBtn').onclick = () => {
+  rawOn = !rawOn;
+  $('rawBtn').setAttribute('aria-pressed', rawOn ? 'true' : 'false');
+  render();
+};
+$('copySvBtn').onclick = copySurvey;
+document.querySelectorAll('[data-f]').forEach(b => b.onclick = () => {
+  dvSrc = b.dataset.f;
+  document.querySelectorAll('[data-f]').forEach(x => x.setAttribute('aria-pressed', x === b ? 'true' : 'false'));
+  render();
+});
+$('dvFilter').oninput = () => render();
+renderSvBtn(svWanted);
 $('soundBtn').onclick = () => {
   sound = !sound; unlockAudio();
   $('soundBtn').textContent = sound ? 'Sound on' : 'Sound off';
