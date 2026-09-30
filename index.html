@@ -296,9 +296,18 @@ function renderLink(){
   if (linked()){
     const quiet = Date.now() - lastHb > 6000;
     el.dataset.state = quiet ? 'warn' : 'live';
+    // fr / ba = Wi-Fi frames / board B's BLE adverts in the last 2 s heartbeat.
+    // A BLE count of 0 while B is linked means B's scanner isn't hearing anything.
+    // Firmware that reports "fr" hops channels 4x a second; its "ch" is just
+    // wherever the hop happened to be (always the same, since the heartbeat
+    // period is a multiple of the hop cycle), so show traffic instead.
     txt.textContent = quiet ? 'Connected, no data from detector'
-      : 'Scanning' + (hbInfo ? ' channel ' + hbInfo.ch : '')
-        + (hbInfo && hbInfo.bl !== undefined ? (hbInfo.bl ? ', board B linked' : ', board B offline') : '');
+      : 'Scanning' + (hbInfo && hbInfo.fr === undefined ? ' channel ' + hbInfo.ch : '')
+        + (hbInfo && hbInfo.fr !== undefined ? ' Wi-Fi ' + hbInfo.fr : '')
+        + (hbInfo && hbInfo.bl !== undefined
+            ? (hbInfo.bl ? ', board B linked' + (hbInfo.ba !== undefined ? ' (BLE ' + hbInfo.ba + ')' : '')
+                         : ', board B offline')
+            : '');
     btn.textContent = 'Disconnect';
   } else if (wantConnected){
     el.dataset.state = 'warn'; txt.textContent = 'Reconnecting…'; btn.textContent = 'Disconnect';
