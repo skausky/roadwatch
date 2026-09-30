@@ -70,6 +70,8 @@ li{display:grid;grid-template-columns:6px minmax(0,1fr) auto;gap:12px;align-item
 .r b{display:block;font-size:23px;font-weight:600}
 .r span{font-size:16px;color:var(--dim)}
 li.stale{opacity:.5}
+li.low .l1{font-size:19px;font-weight:500;color:var(--dim)}
+li.low .r b{font-size:19px;color:var(--dim)}
 .empty{color:var(--dim);margin:8px 0}
 .controls{display:flex;gap:8px;padding:8px 16px 12px;overflow-x:auto}
 .controls button{flex:1 0 auto}
@@ -120,7 +122,10 @@ li.stale{opacity:.5}
 <script>
 const SVC = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
 const TX  = '6e400003-b5a3-f393-e0a9-e50e24dcca9e';
-const CATS = ['Police gear', 'Emergency vehicle router', 'License plate camera'];
+// c:3 = low priority (Ring, CCTV, drones, your watchlist MACs): listed, never
+// the hero, never a sound.
+const CATS = ['Police gear', 'Emergency vehicle router', 'License plate camera', 'Low priority'];
+const LOW = 3;
 const ACTIVE_MS = 12000, KEEP_MS = 10 * 60 * 1000, REALERT_MS = 60000;
 
 const $ = id => document.getElementById(id);
@@ -211,13 +216,13 @@ function handle(msg, demo){
   Object.assign(t, {
     label: msg.l, cat: msg.c | 0, src: msg.s === 'w' ? 'Wi-Fi' : 'Bluetooth',
     rssi: msg.r, trend: msg.t | 0, count: msg.n || 1, last: now,
-    name: msg.nm || t.name
+    name: msg.nm || t.name, board: msg.b || t.board || ''
   });
   t.best = Math.max(t.best, msg.r);
 
   if (isNew){
     t.first = now;
-    alertSound(t.cat);
+    if (t.cat !== LOW) alertSound(t.cat);
     if (!demo){
       t.logEntry = { time: now, cat: t.cat, label: t.label, src: t.src, mac: t.mac,
                      best: t.rssi, lat: pos ? pos.lat : null, lon: pos ? pos.lon : null };
@@ -225,7 +230,7 @@ function handle(msg, demo){
     }
   } else {
     if (t.logEntry && t.rssi > t.logEntry.best) t.logEntry.best = t.rssi;
-    if (t.trend >= 4 && t.rssi > -70 && now - lastCloseBeep > 4000){ lastCloseBeep = now; closingSound(); }
+    if (t.cat !== LOW && t.trend >= 4 && t.rssi > -70 && now - lastCloseBeep > 4000){ lastCloseBeep = now; closingSound(); }
   }
   render();
 }
@@ -244,7 +249,7 @@ function ago(ms){
 function pickHero(now){
   let best = null, score = -1e9;
   for (const t of tracks.values()){
-    if (now - t.last > ACTIVE_MS) continue;
+    if (t.cat === LOW || now - t.last > ACTIVE_MS) continue;
     const s = t.rssi + (t.cat === 0 ? 10 : t.cat === 1 ? 5 : 0);
     if (s > score){ score = s; best = t; }
   }
@@ -271,14 +276,16 @@ function renderHero(now){
 }
 
 function renderList(now){
-  const items = [...tracks.values()].filter(t => now - t.last < KEEP_MS).sort((a, b) => b.last - a.last);
+  // Important hits first (newest first), low priority underneath.
+  const items = [...tracks.values()].filter(t => now - t.last < KEEP_MS)
+    .sort((a, b) => ((a.cat === LOW) - (b.cat === LOW)) || (b.last - a.last));
   $('empty').hidden = items.length > 0;
   $('list').innerHTML = items.map(t => `
-    <li class="${now - t.last > ACTIVE_MS ? 'stale' : ''}">
+    <li class="${now - t.last > ACTIVE_MS ? 'stale' : ''} ${t.cat === LOW ? 'low' : ''}">
       <span class="sw" style="background:${catColor(t.cat)}"></span>
       <div>
         <div class="l1">${esc(t.label)}</div>
-        <div class="l2">${esc(t.src)}, ${esc(t.mac)}${t.name ? ', ' + esc(t.name) : ''}</div>
+        <div class="l2">${esc(t.src)}${t.board ? ' (board ' + esc(t.board) + ')' : ''}, ${esc(t.mac)}${t.name ? ', ' + esc(t.name) : ''}</div>
       </div>
       <div class="r"><b>${t.rssi} dBm</b><span>${ago(now - t.last)}</span></div>
     </li>`).join('');
@@ -289,7 +296,9 @@ function renderLink(){
   if (linked()){
     const quiet = Date.now() - lastHb > 6000;
     el.dataset.state = quiet ? 'warn' : 'live';
-    txt.textContent = quiet ? 'Connected, no data from detector' : 'Scanning' + (hbInfo ? ' channel ' + hbInfo.ch : '');
+    txt.textContent = quiet ? 'Connected, no data from detector'
+      : 'Scanning' + (hbInfo ? ' channel ' + hbInfo.ch : '')
+        + (hbInfo && hbInfo.bl !== undefined ? (hbInfo.bl ? ', board B linked' : ', board B offline') : '');
     btn.textContent = 'Disconnect';
   } else if (wantConnected){
     el.dataset.state = 'warn'; txt.textContent = 'Reconnecting…'; btn.textContent = 'Disconnect';
@@ -362,6 +371,7 @@ function toggleDemo(){
     handle({ m:'00:25:df:0d:e0:01', l:'Axon device', c:0, s:'b', r, t: rising ? 4 : -4, n:k, nm:'' }, true);
     if (k % 15 === 5) handle({ m:'00:30:44:0d:e0:02', l:'Cradlepoint router', c:1, s:'w', r:-78, t:1, n:k, nm:'IBR900-3f1' }, true);
     if (k % 30 === 25) handle({ m:'b4:1e:52:0d:e0:03', l:'Flock camera', c:2, s:'w', r:-84, t:0, n:1, nm:'Flock-7A21' }, true);
+    if (k % 10 === 3) handle({ m:'00:b4:63:0d:e0:04', l:'Ring camera', c:3, s:'w', r:-80, t:0, n:k, nm:'' }, true);
   }, 1000);
   renderLink();
 }
