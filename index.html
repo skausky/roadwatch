@@ -72,6 +72,14 @@ li{display:grid;grid-template-columns:6px minmax(0,1fr) auto;gap:12px;align-item
 li.stale{opacity:.5}
 li.low .l1{font-size:19px;font-weight:500;color:var(--dim)}
 li.low .r b{font-size:19px;color:var(--dim)}
+/* Devices view: everything the boards hear (survey stream) */
+.dv-bar{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:2px 0 8px}
+.dv-bar input{font:inherit;font-size:17px;flex:1 1 140px;min-width:0;padding:8px 10px;border-radius:10px;
+  border:1px solid var(--line);background:var(--raise);color:var(--ink)}
+.chip{min-height:38px;padding:4px 12px;font-size:17px}
+.chip[aria-pressed=true]{background:var(--ink);color:var(--bg);border-color:var(--ink)}
+.l3{font-size:14px;color:var(--dim);overflow-wrap:anywhere;font-family:ui-monospace,Menlo,monospace}
+#raw{margin:0;white-space:pre-wrap;word-break:break-all;font:12px/1.35 ui-monospace,Menlo,monospace;color:var(--dim)}
 .empty{color:var(--dim);margin:8px 0}
 .controls{display:flex;gap:8px;padding:8px 16px 12px;overflow-x:auto}
 .controls button{flex:1 0 auto}
@@ -105,13 +113,31 @@ li.low .r b{font-size:19px;color:var(--dim)}
   </section>
 
   <section class="list">
-    <h2>Seen in the last 10 minutes</h2>
-    <ul id="list"></ul>
-    <p class="empty" id="empty">Nothing detected yet. Detections show up here as you drive.</p>
+    <div id="alertView">
+      <h2>Seen in the last 10 minutes</h2>
+      <ul id="list"></ul>
+      <p class="empty" id="empty">Nothing detected yet. Detections show up here as you drive.</p>
+    </div>
+    <div id="devView" hidden>
+      <div class="dv-bar">
+        <button class="chip" id="svBtn" aria-pressed="false">Stream off</button>
+        <button class="chip" data-f="all" aria-pressed="true">All</button>
+        <button class="chip" data-f="w" aria-pressed="false">Wi-Fi</button>
+        <button class="chip" data-f="b" aria-pressed="false">BLE</button>
+        <button class="chip" id="rawBtn" aria-pressed="false">Raw</button>
+        <button class="chip" id="copySvBtn">Copy survey</button>
+        <input id="dvFilter" type="search" placeholder="Filter: vendor, name, MAC, company ID" autocomplete="off">
+      </div>
+      <h2 id="dvCount">Turn the stream on to see everything the boards hear</h2>
+      <ul id="devList"></ul>
+      <pre id="raw" hidden></pre>
+    </div>
   </section>
 </main>
 
 <footer class="controls">
+  <button id="devBtn">Devices</button>
+  <button id="markBtn">Mark</button>
   <button id="soundBtn">Sound on</button>
   <button id="demoBtn">Demo</button>
   <button id="copyBtn">Copy log</button>
@@ -121,6 +147,7 @@ li.low .r b{font-size:19px;color:var(--dim)}
 
 <script>
 const SVC = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
+const RX  = '6e400002-b5a3-f393-e0a9-e50e24dcca9e';   // commands to the board
 const TX  = '6e400003-b5a3-f393-e0a9-e50e24dcca9e';
 // c:3 = low priority (Ring, CCTV, drones, your watchlist MACs): listed, never
 // the hero, never a sound.
@@ -135,6 +162,27 @@ let lastHb = 0, hbInfo = null, rxBuf = '';
 let sound = true, audio = null, wakeLock = null, pos = null, geoWatch = null;
 let demoTimer = null, lastCloseBeep = 0, heroKey = null;
 let log = loadLog();
+
+/* Survey (Devices view): everything the boards hear, streamed on request.
+   svRaw keeps the raw lines (plus phone time + GPS) for export. */
+const SV_MAX = 4000, SV_FRESH_MS = 60000, SV_SHOW = 200;
+const CID = { '004c':'Apple', '0006':'Microsoft', '00e0':'Google', '0075':'Samsung', '0171':'Amazon',
+              '034d':'TASER/Axon', '09c8':'XUNTONG (Flock battery)', '0059':'Nordic', '02e5':'Espressif',
+              '0087':'Garmin', '000f':'Broadcom' };
+const UUID16 = { 'fc81':'Axon', 'fd5f':'Meta', '180f':'Battery', '180a':'DeviceInfo', 'feaa':'Eddystone',
+                 'fe2c':'Google FastPair', 'fd6f':'ExposureNotif' };
+const KIND = { bcn:'beacon', prq:'probe', prw:'wildcard probe', prs:'probe resp', mgt:'mgmt', dat:'data' };
+let rxCh = null, svWanted = false, devView = false, rawOn = false, dvSrc = 'all', svSavedAt = 0;
+const svDevs = new Map();
+let svRaw = loadSurvey();
+function loadSurvey(){ try { return JSON.parse(localStorage.getItem('rw-survey') || '[]'); } catch(e){ return []; } }
+function saveSurvey(force){
+  const now = Date.now();
+  if (!force && now - svSavedAt < 15000) return;
+  svSavedAt = now;
+  try { localStorage.setItem('rw-survey', JSON.stringify(svRaw.slice(-SV_MAX))); } catch(e){}
+}
+try { svWanted = localStorage.getItem('rw-sv') === 'on'; } catch(e){}
 
 /* ---------- storage ---------- */
 function loadLog(){ try { return JSON.parse(localStorage.getItem('rw-log') || '[]'); } catch(e){ return []; } }
@@ -170,8 +218,21 @@ async function attach(){
   const ch = await svc.getCharacteristic(TX);
   ch.addEventListener('characteristicvaluechanged', onData);
   await ch.startNotifications();
+  try { rxCh = await svc.getCharacteristic(RX); } catch(e){ rxCh = null; }
+  if (svWanted) sendCmd({ cmd: 'sv', on: 1 });   // the board forgets on reconnect
   lastHb = Date.now();
   renderLink();
+}
+
+// Commands are one short JSON line (<= 20 bytes, so they fit before MTU exchange).
+async function sendCmd(obj){
+  if (!rxCh || !linked()) return false;
+  const data = new TextEncoder().encode(JSON.stringify(obj) + '\n');
+  try {
+    if (rxCh.writeValueWithoutResponse) await rxCh.writeValueWithoutResponse(data);
+    else await rxCh.writeValue(data);
+    return true;
+  } catch(e){ return false; }
 }
 
 async function onDisconnected(){
@@ -200,15 +261,18 @@ function onData(e){
   while ((i = rxBuf.indexOf('\n')) >= 0){
     const line = rxBuf.slice(0, i).trim();
     rxBuf = rxBuf.slice(i + 1);
-    if (line) { try { handle(JSON.parse(line)); } catch(err){} }
+    if (line) { try { handle(JSON.parse(line), false, line); } catch(err){} }
   }
   if (rxBuf.length > 1000) rxBuf = '';
 }
 
 /* ---------- detections ---------- */
-function handle(msg, demo){
+function handle(msg, demo, line){
   if (msg.hb){ lastHb = Date.now(); hbInfo = msg; renderLink(); return; }
+  if (msg.ack){ if (msg.ack === 'sv') renderSvBtn(!!msg.on); return; }
+  if (msg.sv){ onSurvey(msg, line); return; }
   if (!msg.m) return;
+  if (line && !demo) keepRaw(line);
   const now = Date.now();
   let t = tracks.get(msg.m);
   const isNew = !t || now - t.last > REALERT_MS;
@@ -216,7 +280,8 @@ function handle(msg, demo){
   Object.assign(t, {
     label: msg.l, cat: msg.c | 0, src: msg.s === 'w' ? 'Wi-Fi' : 'Bluetooth',
     rssi: msg.r, trend: msg.t | 0, count: msg.n || 1, last: now,
-    name: msg.nm || t.name, board: msg.b || t.board || ''
+    name: msg.nm || t.name, board: msg.b || t.board || '',
+    md: msg.md || t.md || '', cf: msg.cf ?? t.cf
   });
   t.best = Math.max(t.best, msg.r);
 
@@ -233,6 +298,137 @@ function handle(msg, demo){
     if (t.cat !== LOW && t.trend >= 4 && t.rssi > -70 && now - lastCloseBeep > 4000){ lastCloseBeep = now; closingSound(); }
   }
   render();
+}
+
+/* ---------- survey (Devices view) ---------- */
+function keepRaw(line){
+  svRaw.push({ ts: Date.now(), lat: pos ? pos.lat : null, lon: pos ? pos.lon : null, line });
+  if (svRaw.length > SV_MAX) svRaw.splice(0, svRaw.length - SV_MAX);
+  saveSurvey(false);
+}
+
+function onSurvey(msg, line){
+  if (line) keepRaw(line);
+  if (msg.sv === 'mark'){ toast('Mark ' + msg.k + ' saved on board ' + msg.b); return; }
+  if (!msg.a) return;   // drops counters etc.
+  const key = msg.b + ' ' + msg.a;
+  let d = svDevs.get(key);
+  if (!d){
+    d = { a: msg.a, b: msg.b, s: msg.s, best: -127, n: 0, names: new Set(), ch: new Set(), k: new Set() };
+    svDevs.set(key, d);
+  }
+  d.last = msg.r; d.best = Math.max(d.best, msg.br ?? msg.r); d.n = Math.max(d.n, msg.n || 0);
+  d.rx = Date.now();
+  ['ss', 'ss2', 'nm'].forEach(f => { if (msg[f]) d.names.add(msg[f]); });
+  (msg.ch || '').split(',').filter(Boolean).forEach(c => d.ch.add(c));
+  (msg.k || '').split(',').filter(Boolean).forEach(k => d.k.add(k));
+  if (msg.v) d.v = msg.v;
+  if (msg.cid){ d.cid = msg.cid; d.md = msg.md || ''; }
+  if (msg.u) d.u = msg.u;
+  if (msg.u128) d.u128 = msg.u128;
+  if (msg.la !== undefined) d.rand = !!msg.la;
+  if (msg.at !== undefined) d.rand = msg.at === 1 || msg.at === 3;
+}
+
+const oui = mac => mac.slice(0, 8).toUpperCase();
+
+// Alerting devices first (police > fleet > Flock > low), then what's been
+// heard in the last minute, strongest first; everything older after that.
+function devRank(d, now){
+  const t = tracks.get(d.a);
+  const cat = t ? [4, 3, 2, 1][t.cat] || 0 : 0;
+  return cat * 1000 + (now - d.rx < SV_FRESH_MS ? 500 : 0) + (d.last ?? -127);
+}
+
+function devTitle(d){
+  const name = [...d.names][0];
+  if (name) return name;
+  if (d.v) return d.v;
+  if (d.cid) return CID[d.cid] ? CID[d.cid] + ' device' : 'Company 0x' + d.cid;
+  return d.rand ? 'Randomized address' : 'OUI ' + oui(d.a);
+}
+
+function devDetail(d){
+  const parts = [];
+  if (d.s === 'w'){
+    if (d.ch.size) parts.push('ch ' + [...d.ch].sort((x, y) => x - y).join(','));
+    if (d.k.size) parts.push([...d.k].map(k => KIND[k] || k).join(', '));
+  } else {
+    if (d.cid) parts.push('cid ' + d.cid + (CID[d.cid] ? ' ' + CID[d.cid] : '') + (d.md ? ' ' + d.md : ''));
+    if (d.u) parts.push('svc ' + d.u.split(',').map(u => u + (UUID16[u] ? ' ' + UUID16[u] : '')).join(', '));
+    if (d.u128) parts.push(d.u128 + '× 128-bit svc');
+  }
+  if (d.names.size > 1) parts.push('also ' + [...d.names].slice(1).join(', '));
+  parts.push(d.n + ' hits');
+  return parts.join(' · ');
+}
+
+function renderDev(now){
+  $('list').parentElement.hidden = devView;
+  if (rawOn){
+    $('devList').hidden = true; $('raw').hidden = false;
+    $('dvCount').textContent = 'Raw log: last 150 of ' + svRaw.length + ' lines, newest at the bottom';
+    $('raw').textContent = svRaw.slice(-150).map(e => e.line).join('\n');
+    return;
+  }
+  $('devList').hidden = false; $('raw').hidden = true;
+  const q = $('dvFilter').value.trim().toLowerCase();
+  let items = [...svDevs.values()].filter(d => dvSrc === 'all' || d.s === dvSrc);
+  if (q) items = items.filter(d =>
+    [d.a, d.v, d.cid, CID[d.cid], d.u, ...d.names].filter(Boolean).join(' ').toLowerCase().includes(q));
+  items.sort((x, y) => devRank(y, now) - devRank(x, now));
+  $('dvCount').textContent = !svDevs.size
+    ? (svWanted ? 'Stream on, waiting for data…' : 'Turn the stream on to see everything the boards hear')
+    : items.length + ' devices' + (items.length > SV_SHOW ? ' (top ' + SV_SHOW + ' shown)' : '')
+      + (svWanted ? '' : ' · stream off');
+  $('devList').innerHTML = items.slice(0, SV_SHOW).map(d => {
+    const t = tracks.get(d.a);
+    return `
+    <li class="${now - d.rx > SV_FRESH_MS ? 'stale' : ''} ${t ? '' : 'low'}">
+      <span class="sw" style="background:${t ? catColor(t.cat) : 'var(--line)'}"></span>
+      <div>
+        <div class="l1">${esc(t ? t.label : devTitle(d))}</div>
+        <div class="l2">${d.s === 'w' ? 'Wi-Fi' : 'Bluetooth'} (board ${esc(d.b)}), ${esc(d.a)}${d.rand ? ' random' : ''}${d.v ? ', ' + esc(d.v) : ''}</div>
+        <div class="l3">${esc(devDetail(d))}</div>
+      </div>
+      <div class="r"><b>${d.last} dBm</b><span>best ${d.best}<br>${ago(now - d.rx)}</span></div>
+    </li>`;
+  }).join('');
+}
+
+function renderSvBtn(on){
+  const b = $('svBtn');
+  b.setAttribute('aria-pressed', on ? 'true' : 'false');
+  b.textContent = on ? 'Stream on' : 'Stream off';
+}
+
+async function toggleStream(){
+  svWanted = !svWanted;
+  try { localStorage.setItem('rw-sv', svWanted ? 'on' : 'off'); } catch(e){}
+  renderSvBtn(svWanted);
+  if (!(await sendCmd({ cmd: 'sv', on: svWanted ? 1 : 0 })) && svWanted)
+    toast('Saved. The stream starts when the detector is connected.');
+  render();
+}
+
+async function mark(){
+  const n = svRaw.filter(e => e.line.includes('"sv":"pmark"')).length + 1;
+  keepRaw('{"sv":"pmark","k":' + n + '}');   // phone-side mark, carries GPS even with the stream off
+  saveSurvey(true);
+  const sent = await sendCmd({ cmd: 'mark' });
+  toast(sent ? 'Mark ' + n + ' (phone) sent to the detector' : 'Mark ' + n + ' saved on the phone only (not connected)');
+}
+
+async function copySurvey(){
+  if (!svRaw.length){ toast('No survey data yet. Turn the stream on first.'); return; }
+  const text = svRaw.map(e => '{"ts":"' + new Date(e.ts).toISOString() + '","lat":' + (e.lat ?? 'null')
+    + ',"lon":' + (e.lon ?? 'null') + ',"d":' + e.line + '}').join('\n');
+  try { await navigator.clipboard.writeText(text); }
+  catch(e){
+    const ta = document.createElement('textarea'); ta.value = text; document.body.appendChild(ta);
+    ta.select(); document.execCommand('copy'); ta.remove();
+  }
+  toast('Copied ' + svRaw.length + ' survey lines (JSON, with time + GPS)');
 }
 
 /* ---------- rendering ---------- */
