@@ -174,6 +174,7 @@ const UUID16 = { 'fc81':'Axon', 'fd5f':'Meta', '180f':'Battery', '180a':'DeviceI
 const KIND = { bcn:'beacon', prq:'probe', prw:'wildcard probe', prs:'probe resp', mgt:'mgmt', dat:'data' };
 let rxCh = null, svWanted = false, devView = false, rawOn = false, dvSrc = 'all', svSavedAt = 0;
 const svDevs = new Map();
+const apNames = new Map();   // BSSID -> SSID, from beacons / probe responses
 let svRaw = loadSurvey();
 function loadSurvey(){ try { return JSON.parse(localStorage.getItem('rw-survey') || '[]'); } catch(e){ return []; } }
 function saveSurvey(force){
@@ -285,6 +286,9 @@ function handle(msg, demo, line){
   });
   t.best = Math.max(t.best, msg.r);
 
+  // "cl":1 = the firmware's strong-signal alarm (police / fleet gear within
+  // tens of metres). Always sounds, on top of the normal alert.
+  if (msg.cl && t.cat !== LOW) urgentSound();
   if (isNew){
     t.first = now;
     if (t.cat !== LOW) alertSound(t.cat);
@@ -323,6 +327,10 @@ function onSurvey(msg, line){
   (msg.ch || '').split(',').filter(Boolean).forEach(c => d.ch.add(c));
   (msg.k || '').split(',').filter(Boolean).forEach(k => d.k.add(k));
   if (msg.v) d.v = msg.v;
+  if (msg.bs) d.bs = msg.bs;
+  // A beacon / probe-response SSID is that access point's own network name;
+  // remember it so clients ("bs") can be shown as "on <network>".
+  if (msg.ss && /bcn|prs/.test(msg.k || '')) apNames.set(msg.a, msg.ss);
   if (msg.cid){ d.cid = msg.cid; d.md = msg.md || ''; }
   if (msg.u) d.u = msg.u;
   if (msg.u128) d.u128 = msg.u128;
@@ -340,9 +348,23 @@ function devRank(d, now){
   return cat * 1000 + (now - d.rx < SV_FRESH_MS ? 500 : 0) + (d.last ?? -127);
 }
 
+// A Wi-Fi device that never beacons isn't an access point: its SSIDs are
+// networks it's searching for (probe requests), not its own name.
+const isAp = d => d.k.has('bcn') || d.k.has('prs');
+
+// "on HomeNet" for a client whose access point we know.
+function netOf(d){
+  if (!d.bs) return '';
+  const ssid = apNames.get(d.bs);
+  if (ssid) return ssid;
+  const ap = svDevs.get(d.b + ' ' + d.bs);
+  return 'hidden network ' + d.bs + (ap && ap.v ? ' (' + ap.v + ')' : '');
+}
+
 function devTitle(d){
-  const name = [...d.names][0];
+  const name = (d.s !== 'w' || isAp(d)) ? [...d.names][0] : '';
   if (name) return name;
+  if (d.s === 'w' && d.bs && apNames.get(d.bs)) return 'Client of ' + apNames.get(d.bs);
   if (d.v) return d.v;
   if (d.cid) return CID[d.cid] ? CID[d.cid] + ' device' : 'Company 0x' + d.cid;
   return d.rand ? 'Randomized address' : 'OUI ' + oui(d.a);
@@ -353,12 +375,14 @@ function devDetail(d){
   if (d.s === 'w'){
     if (d.ch.size) parts.push('ch ' + [...d.ch].sort((x, y) => x - y).join(','));
     if (d.k.size) parts.push([...d.k].map(k => KIND[k] || k).join(', '));
+    if (d.bs) parts.push('on ' + netOf(d));
+    if (!isAp(d) && d.names.size) parts.push('looking for ' + [...d.names].join(', '));
   } else {
     if (d.cid) parts.push('cid ' + d.cid + (CID[d.cid] ? ' ' + CID[d.cid] : '') + (d.md ? ' ' + d.md : ''));
     if (d.u) parts.push('svc ' + d.u.split(',').map(u => u + (UUID16[u] ? ' ' + UUID16[u] : '')).join(', '));
     if (d.u128) parts.push(d.u128 + '× 128-bit svc');
   }
-  if (d.names.size > 1) parts.push('also ' + [...d.names].slice(1).join(', '));
+  if (d.names.size > 1 && (d.s !== 'w' || isAp(d))) parts.push('also ' + [...d.names].slice(1).join(', '));
   parts.push(d.n + ' hits');
   return parts.join(' · ');
 }
@@ -374,7 +398,7 @@ function renderDev(now){
   const q = $('dvFilter').value.trim().toLowerCase();
   let items = [...svDevs.values()].filter(d => dvSrc === 'all' || d.s === dvSrc);
   if (q) items = items.filter(d =>
-    [d.a, d.v, d.cid, CID[d.cid], d.u, ...d.names].filter(Boolean).join(' ').toLowerCase().includes(q));
+    [d.a, d.v, d.cid, CID[d.cid], d.u, d.bs, apNames.get(d.bs), ...d.names].filter(Boolean).join(' ').toLowerCase().includes(q));
   items.sort((x, y) => devRank(y, now) - devRank(x, now));
   $('dvCount').textContent = !svDevs.size
     ? (svWanted ? 'Stream on, waiting for data…' : 'Turn the stream on to see everything the boards hear')
@@ -493,6 +517,7 @@ function alertDetail(t){
   if (t.cf !== undefined) parts.push('confidence T' + t.cf);
   const sd = svDevs.get((t.board || 'A') + ' ' + t.mac);
   if (sd && sd.ch.size) parts.push('ch ' + [...sd.ch].sort((x, y) => x - y).join(','));
+  if (sd && sd.bs) parts.push('on ' + netOf(sd));
   return parts.join(' · ');
 }
 
@@ -513,7 +538,9 @@ function renderLink(){
         + (hbInfo && hbInfo.bl !== undefined
             ? (hbInfo.bl ? ', board B linked' + (hbInfo.ba !== undefined ? ' (BLE ' + perSec(hbInfo.ba) + '/s)' : '')
                          : ', board B offline')
-            : '');
+            : '')
+        // qd / od: detections the firmware couldn't queue or deliver — should be 0.
+        + (hbInfo && (hbInfo.qd || hbInfo.od) ? ' — LOST ' + ((hbInfo.qd | 0) + (hbInfo.od | 0)) + ' hits' : '');
     btn.textContent = 'Disconnect';
   } else if (wantConnected){
     el.dataset.state = 'warn'; txt.textContent = 'Reconnecting…'; btn.textContent = 'Disconnect';
@@ -550,6 +577,11 @@ function alertSound(cat){
   if (cat === 0) [0,1,2,3].forEach(i => tone(i % 2 ? 740 : 990, t + i * .18, .16));
   else if (cat === 1) { tone(660, t, .15); tone(660, t + .25, .15); }
   else tone(440, t, .45, 'sine', .25);
+}
+function urgentSound(){
+  if (!sound || !audio) return;
+  const t = audio.currentTime + .05;
+  for (let i = 0; i < 12; i++) tone(i % 2 ? 880 : 1320, t + i * .1, .08, 'square', .22);
 }
 function closingSound(){ if (sound && audio) tone(1200, audio.currentTime + .02, .08); }
 
@@ -619,7 +651,7 @@ $('copyBtn').onclick = copyLog;
 $('clearBtn').onclick = () => {
   if (!confirm('Clear the screen, the saved log and the survey data?')) return;
   tracks.clear(); log = []; saveLog();
-  svDevs.clear(); svRaw = []; saveSurvey(true);
+  svDevs.clear(); apNames.clear(); svRaw = []; saveSurvey(true);
   render(); toast('Cleared');
 };
 $('devBtn').onclick = () => {
