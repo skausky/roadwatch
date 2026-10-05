@@ -139,6 +139,7 @@ li.low .r b{font-size:19px;color:var(--dim)}
   <button id="devBtn">Devices</button>
   <button id="markBtn">Mark</button>
   <button id="soundBtn">Sound on</button>
+  <button id="testBtn">Test sounds</button>
   <button id="demoBtn">Demo</button>
   <button id="copyBtn">Copy log</button>
   <button id="clearBtn">Clear</button>
@@ -270,7 +271,11 @@ function onData(e){
 /* ---------- detections ---------- */
 function handle(msg, demo, line){
   if (msg.hb){ lastHb = Date.now(); hbInfo = msg; renderLink(); return; }
-  if (msg.ack){ if (msg.ack === 'sv') renderSvBtn(!!msg.on); return; }
+  if (msg.ack){
+    if (msg.ack === 'sv') renderSvBtn(!!msg.on);
+    if (msg.ack === 'bz' && !msg.bl) toast('Board B is not linked, so its buzzer can’t play the test');
+    return;
+  }
   if (msg.sv){ onSurvey(msg, line); return; }
   if (!msg.m) return;
   if (line && !demo) keepRaw(line);
@@ -299,7 +304,8 @@ function handle(msg, demo, line){
     }
   } else {
     if (t.logEntry && t.rssi > t.logEntry.best) t.logEntry.best = t.rssi;
-    if (t.cat !== LOW && t.trend >= 4 && t.rssi > -70 && now - lastCloseBeep > 4000){ lastCloseBeep = now; closingSound(); }
+    // Police has its own Geiger tick (geigerTick); this ping is for fleet / Flock.
+    if (t.cat !== LOW && t.cat !== 0 && t.trend >= 4 && t.rssi > -70 && now - lastCloseBeep > 4000){ lastCloseBeep = now; closingSound(); }
   }
   render();
 }
@@ -591,6 +597,40 @@ function urgentSound(){
 }
 function closingSound(){ if (sound && audio) tone(1200, audio.currentTime + .02, .08); }
 
+// Police Geiger, same curve as board B's buzzer: while police gear was heard
+// in the last 6 s, tick every 1.5 s at -95 dBm down to every 120 ms at -50.
+const GEIGER_HOLD_MS = 6000, DEMO_MS = 8000;
+let geigerAt = 0, demoGeigerAt = 0;
+const geigerPeriod = r => { const c = Math.max(-95, Math.min(-50, r)); return 1500 - (c + 95) * 1380 / 45; };
+function geigerTick(){
+  if (!sound || !audio) return;
+  const now = Date.now();
+  let r = null;
+  if (demoGeigerAt && now - demoGeigerAt < DEMO_MS) r = -95 + (now - demoGeigerAt) * 50 / DEMO_MS;
+  else {
+    demoGeigerAt = 0;
+    for (const t of tracks.values())
+      if (t.cat === 0 && now - t.last < GEIGER_HOLD_MS && (r === null || t.rssi > r)) r = t.rssi;
+  }
+  if (r === null || now - geigerAt < geigerPeriod(r)) return;
+  geigerAt = now;
+  tone(1500, audio.currentTime + .01, .03, 'square', .14);
+}
+setInterval(geigerTick, 40);
+
+// Test sounds: each press plays the next one on the phone and on B's buzzer.
+const TESTS = ['Police', 'Fleet router', 'Flock camera', 'Strong-signal alarm', 'Police approaching (8 s)'];
+let testIdx = 0;
+async function testSound(){
+  unlockAudio();
+  const p = testIdx;
+  testIdx = (testIdx + 1) % TESTS.length;
+  if (p <= 2) alertSound(p); else if (p === 3) urgentSound(); else demoGeigerAt = Date.now();
+  const sent = await sendCmd({ cmd: 'bz', p });
+  toast('Test: ' + TESTS[p] + (sent ? ' (phone + buzzer)' : ' (phone only, not connected)')
+        + (sound ? '' : '. Phone sound is off'));
+}
+
 /* ---------- location, wake lock, toast ---------- */
 function startGeo(){
   if (geoWatch !== null || !navigator.geolocation) return;
@@ -667,6 +707,7 @@ $('devBtn').onclick = () => {
   render();
 };
 $('markBtn').onclick = mark;
+$('testBtn').onclick = testSound;
 $('svBtn').onclick = toggleStream;
 $('rawBtn').onclick = () => {
   rawOn = !rawOn;
