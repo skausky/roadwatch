@@ -282,7 +282,7 @@ function handle(msg, demo, line){
     label: msg.l, cat: msg.c | 0, src: msg.s === 'w' ? 'Wi-Fi' : 'Bluetooth',
     rssi: msg.r, trend: msg.t | 0, count: msg.n || 1, last: now,
     name: msg.nm || t.name, board: msg.b || t.board || '',
-    md: msg.md || t.md || '', cf: msg.cf ?? t.cf
+    md: msg.md || t.md || '', cf: msg.cf ?? t.cf, ch: msg.ch || t.ch
   });
   t.best = Math.max(t.best, msg.r);
 
@@ -517,6 +517,7 @@ function alertDetail(t){
   if (t.cf !== undefined) parts.push('confidence T' + t.cf);
   const sd = svDevs.get((t.board || 'A') + ' ' + t.mac);
   if (sd && sd.ch.size) parts.push('ch ' + [...sd.ch].sort((x, y) => x - y).join(','));
+  else if (t.ch) parts.push('ch ' + t.ch);
   if (sd && sd.bs) parts.push('on ' + netOf(sd));
   return parts.join(' · ');
 }
@@ -536,8 +537,13 @@ function renderLink(){
       : 'Scanning' + (hbInfo && hbInfo.fr === undefined ? ' channel ' + hbInfo.ch : '')
         + (hbInfo && hbInfo.fr !== undefined ? ', Wi-Fi ' + perSec(hbInfo.fr) + ' pkt/s' : '')
         + (hbInfo && hbInfo.bl !== undefined
-            ? (hbInfo.bl ? ', board B linked' + (hbInfo.ba !== undefined ? ' (BLE ' + perSec(hbInfo.ba) + '/s)' : '')
-                         : ', board B offline')
+            ? (hbInfo.bl ? ', B linked' + (hbInfo.ba !== undefined ? ' (BLE ' + perSec(hbInfo.ba) + '/s)' : '')
+                         : ', B offline')
+            : '')
+        // lc / cw: board C (main Wi-Fi sniffer) linked / its Wi-Fi packets.
+        + (hbInfo && hbInfo.lc !== undefined
+            ? (hbInfo.lc ? ', C linked' + (hbInfo.cw !== undefined ? ' (Wi-Fi ' + perSec(hbInfo.cw) + ' pkt/s)' : '')
+                         : ', C offline')
             : '')
         // qd / od: detections the firmware couldn't queue or deliver — should be 0.
         + (hbInfo && (hbInfo.qd || hbInfo.od) ? ' — LOST ' + ((hbInfo.qd | 0) + (hbInfo.od | 0)) + ' hits' : '');
